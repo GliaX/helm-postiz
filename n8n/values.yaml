@@ -1,0 +1,98 @@
+# ---------------------------------------------------------------------------
+# Glia n8n (n8n.glia.org) — the Postiz <-> ERPNext integration layer.
+# SANITIZED values; secrets via n8n/values.secret.yaml.
+#
+# Deploy:
+#   helm -n n8n upgrade --install n8n \
+#     oci://8gears.container-registry.com/library/n8n --version 2.1.1 \
+#     -f n8n/values.yaml -f n8n/values.secret.yaml
+#
+# Chart notes (8gears/n8n-helm-chart 2.x):
+#   - main.config -> ConfigMap env vars, main.secret -> Secret env vars
+#     (nested camelCase keys flatten to UPPER_SNAKE: main.config.n8n.host
+#     becomes N8N_HOST). See chart README for the mapping rules.
+#   - n8n env var reference: https://docs.n8n.io/hosting/configuration/environment-variables/
+#   - Data: SQLite on the PVC (chart default). When we cross the Redis/managed-DB
+#     bridge, switch to DB_TYPE=postgresdb + queue mode.
+# ---------------------------------------------------------------------------
+
+image:
+  repository: n8nio/n8n
+  tag: ""            # empty = chart appVersion (pinned by the chart release)
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    kubernetes.io/tls-acme: "true"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: n8n.glia.org
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - hosts:
+        - n8n.glia.org
+      secretName: n8n-tls
+
+main:
+  config:
+    n8n:
+      host: "n8n.glia.org"
+      protocol: "https"
+      editor_base_url: "https://n8n.glia.org/"
+      webhook_url: "https://n8n.glia.org/"
+      # Task runners (n8n 1.13+ recommended setup; required soon).
+      runners:
+        enabled: true
+      # Community packages enabled by default on self-host; explicit for
+      # clarity — used to install `n8n-nodes-postiz` (Postiz node) via the UI:
+      # Settings -> Community nodes -> Install -> npm package `n8n-nodes-postiz`
+      # NOTE: the chart joins nested keys with '_' but does NOT split camelCase,
+      # so keys here must be snake_case or they produce wrong env var names
+      # (e.g. communityPackages -> N8N_COMMUNITYPACKAGES_ENABLED, invalid).
+      community_packages:
+        enabled: true
+    generic:
+      timezone: "America/Toronto"
+
+  secret:
+    n8n:
+      # REQUIRED: persists credentials/workflow encryption across restarts.
+      # openssl rand -base64 48 — supply via values.secret.yaml. LOSING THIS
+      # KEY = all n8n credentials unreadable.
+      encryption_key: ""  # supply via values.secret.yaml
+
+  # SQLite + /home/node/.n8n on the PVC. RWO -> Recreate strategy (already the
+  # chart default; kept explicit because of the Multi-Attach rollout deadlock
+  # we hit with ERPNext's sites PVC).
+  persistence:
+    enabled: true
+    type: dynamic
+    storageClass: do-block-storage
+    accessModes:
+      - ReadWriteOnce
+    size: 5Gi
+
+  deploymentStrategy:
+    type: "Recreate"
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+
+# Queue mode / webhook workers / sandbox: not needed at our scale.
+worker:
+  enabled: false
+webhook:
+  enabled: false
+sandbox:
+  enabled: false
+scaling:
+  enabled: false
+valkey:
+  enabled: false

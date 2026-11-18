@@ -1,0 +1,156 @@
+# ---------------------------------------------------------------------------
+# Glia Postiz (postiz.glia.org) — SANITIZED values. No secrets in this file.
+#
+# Secrets live in the gitignored overlay: postiz/values.secret.yaml
+# (see postiz/values.secret.example.yaml for the template).
+#
+# Deploy (see README for bootstrap prerequisites):
+#   helm -n postiz upgrade --install postiz \
+#     oci://ghcr.io/gitroomhq/postiz-helmchart/charts/postiz-app --version 1.0.5 \
+#     -f postiz/values.yaml -f postiz/values.secret.yaml
+#
+# UPSTREAM CHART (gitroomhq/postiz-helmchart 1.0.5):
+#   - Renders all `.secrets` keys into one Opaque Secret, envFrom'd by the pod;
+#     keys are a free-form map, so provider keys not listed upstream
+#     (FACEBOOK_APP_ID, ENCRYPTION_KEY, TEMPORAL_*, ...) work fine here.
+#   - Renders all `.env` keys into a ConfigMap, envFrom'd by the pod.
+#   - Service port 80 -> containerPort 5000 (the postiz image listens on 5000).
+#
+# GOTCHA (RWO uploads PVC, same failure mode as helm-erpnext's sites PVC):
+#   the upstream chart exposes NO deployment.strategy knob, so rollouts default
+#   to RollingUpdate(maxSurge=1, maxUnavailable=0). With an RWO PVC the new pod
+#   cannot attach the volume while the old pod still holds it -> rollout
+#   deadlock (Multi-Attach). ALWAYS scale the deployment to 0 before upgrading,
+#   then let the helm upgrade bring it back to `replicaCount`. The CD workflow
+#   does this automatically; do the same for manual upgrades (commands in README).
+# ---------------------------------------------------------------------------
+
+fullnameOverride: postiz
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/gitroomhq/postiz-app
+  # Pin releases deliberately; upstream chart default is "latest" which breaks
+  # reproducibility. Latest release as of 2026-11: v2.26.0.
+  tag: "v2.26.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    kubernetes.io/tls-acme: "true"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+  hosts:
+    - host: postiz.glia.org
+      paths:
+        - path: /
+          pathType: Prefix
+          port: 80
+  tls:
+    - secretName: postiz-tls
+      hosts:
+        - postiz.glia.org
+
+# --- Databases ---------------------------------------------------------------
+# PostgreSQL: DigitalOcean MANAGED database (db `postiz`). Connection string in
+# the secrets overlay as DATABASE_URL. The chart's in-cluster postgresql
+# subchart must stay disabled.
+postgresql:
+  enabled: false
+
+# Redis: in-cluster bitnami subchart (upstream pins redis 20.1.0).
+# NOTE: Broadcom moved Bitnami's public images to docker.io/bitnamilegacy
+# (frozen, no updates) — same workaround helm-erpnext uses for its bitnami
+# aliases. When we decide to cross the Redis bridge, switch to DO managed
+# Valkey: redis.enabled=false + REDIS_URL in the secrets overlay.
+redis:
+  enabled: true
+  architecture: standalone
+  auth:
+    # Must stay in sync with REDIS_URL in values.secret.yaml.
+    password: ""  # supply via values.secret.yaml
+  image:
+    repository: bitnamilegacy/redis
+    tag: "7.2.5-debian-12-r3"
+
+# --- Environment (ConfigMap, non-secret) --------------------------------------
+env:
+  # Required core (docs.postiz.com/self-host/configuration/reference).
+  # Single-container deployment: frontend + API on one origin, /api proxied
+  # internally, SSR talks to the API on localhost:3000.
+  FRONTEND_URL: "https://postiz.glia.org"
+  NEXT_PUBLIC_BACKEND_URL: "https://postiz.glia.org/api"
+  BACKEND_INTERNAL_URL: "http://localhost:3000"
+
+  # Behaviour
+  IS_GENERAL: "true"            # upstream: "required for now"
+  NX_ADD_PLUGINS: "false"
+  DISABLE_REGISTRATION: "true"  # per Postiz docs: allows ONE signup (the owner)
+                                # then disables the sign-up page. Keep true.
+                                # Note: also disables OIDC/OAuth sign-in (unused).
+  API_LIMIT: "90"               # public-API create-post / hour (N8N bursts)
+
+  # Storage: local uploads on the postiz-uploads PVC (see extraVolumes below).
+  # Cloudflare R2 is the upstream default for things like channel avatars —
+  # without it, avatar saving may fail (cosmetic; posting works).
+  STORAGE_PROVIDER: "local"
+  UPLOAD_DIRECTORY: "/uploads"
+  NEXT_PUBLIC_UPLOAD_STATIC_DIRECTORY: "/uploads"
+
+  # Background scheduled-task workers run in-process (upstream compose does
+  # the same alongside the Temporal stack).
+  RUN_CRON: "true"
+
+  # Temporal — REQUIRED since Postiz v2.12 for scheduled posts. Deployed as a
+  # separate helm release in this namespace (see temporal/ in this repo).
+  TEMPORAL_ADDRESS: "temporal-frontend.postiz.svc.cluster.local:7233"
+  TEMPORAL_NAMESPACE: "default"
+
+  # Email (nodemailer via existing Glia SMTP). Presence of EMAIL_PROVIDER
+  # turns on user-activation emails; keep the values in the secrets overlay
+  # alongside EMAIL_PASS. Remove them to auto-activate users instead.
+  # EMAIL_PROVIDER: "nodemailer"
+  # EMAIL_HOST: "mail.emlondon.ca"
+  # EMAIL_PORT: "587"
+  # EMAIL_USER: "erp@glia.org"
+  # EMAIL_SECURE: "false"
+  # EMAIL_FROM_ADDRESS: "info@glia.org"
+  # EMAIL_FROM_NAME: "Glia"
+
+# --- Uploads persistence -------------------------------------------------------
+# The PVC is pre-created from postiz/manifests/postiz-uploads-pvc.yaml (the
+# upstream chart has no PVC template). RWO on do-block-storage -> see the
+# scale-to-0 rollout gotcha at the top of this file.
+extraVolumes:
+  - name: uploads-volume
+    persistentVolumeClaim:
+      claimName: postiz-uploads
+extraVolumeMounts:
+  - name: uploads-volume
+    mountPath: /uploads
+
+# --- Resources ------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 2Gi
+
+# --- Secrets (rendered into the postiz-secrets Opaque Secret) --------------------
+# Empty placeholders documented here; real values via values.secret.yaml.
+secrets:
+  DATABASE_URL: ""      # postgresql://postiz:<pw>@<do-pg-host>:25061/postiz?sslmode=require
+  REDIS_URL: ""         # redis://:<redis-auth-pw>@postiz-redis-master.postiz.svc.cluster.local:6379/0
+  JWT_SECRET: ""        # openssl rand -base64 48
+  ENCRYPTION_KEY: ""    # openssl rand -base64 32 (encrypts channel tokens at rest)
+  FACEBOOK_APP_ID: ""   # one Meta app covers Facebook AND Instagram (FB-linked)
+  FACEBOOK_APP_SECRET: ""
+  EMAIL_PASS: ""        # SMTP password for erp@glia.org (mail.emlondon.ca)

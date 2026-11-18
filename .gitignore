@@ -1,0 +1,13 @@
+# Secret overlays — NEVER commit (same convention as helm-erpnext).
+*/values.secret.yaml
+values.secret.yaml
+
+# Helm build artifacts
+charts/
+*.tgz
+*.tgz.provenance*
+*.tgz.sha256*
+
+# Local scratch
+/tmp/
+*.log

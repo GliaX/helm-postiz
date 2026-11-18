@@ -1,0 +1,225 @@
+name: deploy
+
+# Deploys Postiz (+ its Temporal dependency) and n8n to the Glia DOKS cluster.
+#
+# Required GitHub Environment secrets (environment: "production"):
+#   DIGITALOCEAN_ACCESS_TOKEN  — DO API token (read scope is not enough; needs
+#                                k8s: read/update for kubeconfig generation)
+#   CLUSTER_NAME               — DOKS cluster name (doctl kubernetes cluster list)
+#   POSTIZ_SECRET_VALUES       — full contents of postiz/values.secret.yaml
+#   TEMPORAL_SECRET_VALUES     — full contents of temporal/values.secret.yaml
+#   N8N_SECRET_VALUES          — full contents of n8n/values.secret.yaml
+#
+# Same philosophy as helm-erpnext: this repo is the source of truth; values are
+# sanitized in git, secrets arrive from the GitHub Environment at deploy time.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "postiz/**"
+      - "temporal/**"
+      - "n8n/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "Which app to deploy"
+        type: choice
+        default: all
+        options:
+          - all
+          - postiz
+          - temporal
+          - n8n
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      postiz: ${{ steps.filter.outputs.postiz }}
+      temporal: ${{ steps.filter.outputs.temporal }}
+      n8n: ${{ steps.filter.outputs.n8n }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            postiz:
+              - 'postiz/**'
+            temporal:
+              - 'temporal/**'
+            n8n:
+              - 'n8n/**'
+            deploy:
+              - '.github/workflows/deploy.yml'
+
+  # Renders every app against its example overlay — catches YAML/values errors
+  # before anything touches the cluster. No DO credentials needed.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: helm template postiz (example overlay)
+        run: |
+          helm template postiz \
+            oci://ghcr.io/gitroomhq/postiz-helmchart/charts/postiz-app --version 1.0.5 \
+            -n postiz \
+            -f postiz/values.yaml -f postiz/values.secret.example.yaml > /dev/null
+
+      - name: helm template temporal (example overlay)
+        run: |
+          helm repo add temporal https://go.temporal.io/helm-charts
+          helm repo update
+          helm template temporal temporal/temporal --version 1.8.0 \
+            -n postiz \
+            -f temporal/values.yaml -f temporal/values.secret.example.yaml > /dev/null
+
+      - name: helm template n8n (example overlay)
+        run: |
+          helm template n8n \
+            oci://8gears.container-registry.com/library/n8n --version 2.1.1 \
+            -n n8n \
+            -f n8n/values.yaml -f n8n/values.secret.example.yaml > /dev/null
+
+  deploy-postiz:
+    needs: [changes, verify]
+    if: >-
+      (needs.changes.outputs.postiz == 'true' || needs.changes.outputs.deploy == 'true') ||
+      (github.event_name == 'workflow_dispatch' && (inputs.app == 'postiz' || inputs.app == 'all'))
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Get cluster credentials
+        run: doctl kubernetes cluster kubeconfig save --expiry-seconds 3600 "${{ secrets.CLUSTER_NAME }}"
+
+      - name: Ensure namespace
+        run: kubectl create namespace postiz --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply uploads PVC
+        run: kubectl apply -f postiz/manifests/postiz-uploads-pvc.yaml
+
+      - name: Write secrets overlay
+        env:
+          POSTIZ_SECRET_VALUES: ${{ secrets.POSTIZ_SECRET_VALUES }}
+        run: |
+          if [ -z "$POSTIZ_SECRET_VALUES" ]; then
+            echo "::error::Environment secret POSTIZ_SECRET_VALUES is not set (contents of postiz/values.secret.yaml)"
+            exit 1
+          fi
+          printf '%s' "$POSTIZ_SECRET_VALUES" > postiz/values.secret.yaml
+
+      # RWO PVC gotcha (see postiz/values.yaml header): scale to 0 first so the
+      # volume is released, then the upgrade brings it back to replicaCount.
+      # --atomic restores the previous release (replicas 1) on failure.
+      - name: Scale postiz to 0 (release RWO volume)
+        run: kubectl -n postiz scale deployment/postiz --replicas=0 || true
+
+      - name: helm upgrade --install postiz
+        run: |
+          helm -n postiz upgrade --install postiz \
+            oci://ghcr.io/gitroomhq/postiz-helmchart/charts/postiz-app --version 1.0.5 \
+            -f postiz/values.yaml -f postiz/values.secret.yaml \
+            --atomic --timeout 10m
+
+      - name: Wait for rollout
+        run: kubectl -n postiz rollout status deployment/postiz --timeout=10m
+
+  deploy-temporal:
+    needs: [changes, verify]
+    if: >-
+      (needs.changes.outputs.temporal == 'true' || needs.changes.outputs.deploy == 'true') ||
+      (github.event_name == 'workflow_dispatch' && (inputs.app == 'temporal' || inputs.app == 'all'))
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Get cluster credentials
+        run: doctl kubernetes cluster kubeconfig save --expiry-seconds 3600 "${{ secrets.CLUSTER_NAME }}"
+
+      - name: Ensure namespace
+        run: kubectl create namespace postiz --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Write secrets overlay
+        env:
+          TEMPORAL_SECRET_VALUES: ${{ secrets.TEMPORAL_SECRET_VALUES }}
+        run: |
+          if [ -z "$TEMPORAL_SECRET_VALUES" ]; then
+            echo "::error::Environment secret TEMPORAL_SECRET_VALUES is not set (contents of temporal/values.secret.yaml)"
+            exit 1
+          fi
+          printf '%s' "$TEMPORAL_SECRET_VALUES" > temporal/values.secret.yaml
+
+      - name: helm repo add temporal
+        run: |
+          helm repo add temporal https://go.temporal.io/helm-charts
+          helm repo update
+
+      - name: helm upgrade --install temporal
+        run: |
+          helm -n postiz upgrade --install temporal temporal/temporal --version 1.8.0 \
+            -f temporal/values.yaml -f temporal/values.secret.yaml \
+            --atomic --timeout 10m
+
+      - name: Wait for frontend rollout
+        run: kubectl -n postiz rollout status deployment/temporal-frontend --timeout=10m
+
+  deploy-n8n:
+    needs: [changes, verify]
+    if: >-
+      (needs.changes.outputs.n8n == 'true' || needs.changes.outputs.deploy == 'true') ||
+      (github.event_name == 'workflow_dispatch' && (inputs.app == 'n8n' || inputs.app == 'all'))
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Get cluster credentials
+        run: doctl kubernetes cluster kubeconfig save --expiry-seconds 3600 "${{ secrets.CLUSTER_NAME }}"
+
+      - name: Ensure namespace
+        run: kubectl create namespace n8n --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Write secrets overlay
+        env:
+          N8N_SECRET_VALUES: ${{ secrets.N8N_SECRET_VALUES }}
+        run: |
+          if [ -z "$N8N_SECRET_VALUES" ]; then
+            echo "::error::Environment secret N8N_SECRET_VALUES is not set (contents of n8n/values.secret.yaml)"
+            exit 1
+          fi
+          printf '%s' "$N8N_SECRET_VALUES" > n8n/values.secret.yaml
+
+      - name: helm upgrade --install n8n
+        run: |
+          helm -n n8n upgrade --install n8n \
+            oci://8gears.container-registry.com/library/n8n --version 2.1.1 \
+            -f n8n/values.yaml -f n8n/values.secret.yaml \
+            --atomic --timeout 10m
+
+      - name: Wait for rollout
+        run: kubectl -n n8n rollout status deployment/n8n --timeout=10m

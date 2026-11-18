@@ -1,0 +1,23 @@
+# Uploads PVC for Postiz. Applied by CD (and by bootstrap) BEFORE the helm
+# release — the upstream postiz chart has no PVC template, it only accepts
+# extraVolumes pointing at an existing claim.
+#
+# RWO on do-block-storage: the postiz deployment MUST be scaled to 0 before
+# each helm upgrade (see postiz/values.yaml header + README).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postiz-uploads
+  namespace: postiz
+  labels:
+    app.kubernetes.io/name: postiz
+    app.kubernetes.io/part-of: glia-social
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: do-block-storage
+  resources:
+    requests:
+      storage: 10Gi
