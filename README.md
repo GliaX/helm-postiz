@@ -8,6 +8,9 @@ Same philosophy as helm-erpnext: **Helm-as-Code**, sanitized values in git, secr
 gitignored `values.secret.yaml` overlays (deployed from GitHub Environment secrets).
 `kubectl apply` / manual dashboard edits should be avoided going forward.
 
+> **Access-gated bootstrap pending:** see [`HANDOFF.md`](HANDOFF.md) for the three
+> steps that require GitHub admin / DO managed-DB / Meta-DNS access.
+
 ---
 
 ## What's deployed
